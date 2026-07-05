@@ -9,8 +9,16 @@
  */
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 
-const db = new Database(process.env.DB_PATH || path.join(__dirname, 'boosthub.db'));
+// บน Render ต้องชี้ DB_PATH ไปที่ Persistent Disk (เช่น /data/boosthub.db)
+// ไม่งั้นไฟล์ DB จะถูกล้างทุกครั้งที่ deploy/restart
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'boosthub.db');
+// สร้างโฟลเดอร์ปลายทางให้แน่ใจว่ามีอยู่ (กัน crash ตอน mount disk ครั้งแรก)
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+const db = new Database(DB_PATH);
+console.log('[db] ใช้ฐานข้อมูลที่:', DB_PATH);
 db.pragma('journal_mode = WAL');   // อ่าน/เขียนพร้อมกันได้ดีขึ้น
 db.pragma('foreign_keys = ON');
 

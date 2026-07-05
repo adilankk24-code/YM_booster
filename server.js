@@ -14,6 +14,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
+const rateLimit = require('express-rate-limit');
 
 const { users, orders, deposits, ledger } = require('./db');
 const { register, login, forgotPassword, resetPassword, verify2fa, setup2fa, enable2fa, disable2fa, requireAuth, requireAdmin, optionalAuth, publicUser } = require('./auth');
@@ -40,8 +41,27 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_placeholder');
 
 const app = express();
 
+// ⭐ อยู่หลัง reverse proxy ของ Render — ต้องเชื่อ header X-Forwarded-For
+// เพื่อให้ req.ip เป็น IP จริงของลูกค้า ไม่ใช่ IP ของ proxy
+// (ถ้าไม่ตั้ง: rate limit จะเห็นลูกค้าทุกคนเป็น IP เดียว → ล็อกทั้งเว็บพร้อมกัน)
+// ตั้งเป็น 1 = เชื่อ proxy ชั้นเดียว (ของ Render) — อย่าตั้ง true ซึ่งเปิดกว้างเกินไป
+app.set('trust proxy', 1);
+
+// ── CORS: อนุญาตเฉพาะโดเมนหน้าเว็บจริงเท่านั้น ──
+// FRONTEND_ORIGIN ใส่ได้หลายโดเมนคั่นด้วย comma เช่น
+//   https://boosthub.com,https://www.boosthub.com
+// ค่าเริ่มต้น '*' = เปิดทุกโดเมน (ใช้ได้ตอน dev แต่ห้ามใช้ตอนเปิดจริง — checkEnv จะเตือน)
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '*';
-app.use(cors({ origin: FRONTEND_ORIGIN }));
+const allowedOrigins = FRONTEND_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean);
+const corsOptions = {
+  origin(origin, cb) {
+    // ไม่มี header origin = เรียกจาก server/มือถือ/curl/health check → ปล่อยผ่าน
+    if (!origin) return cb(null, true);
+    const ok = allowedOrigins.includes('*') || allowedOrigins.includes(origin);
+    cb(null, ok);   // ไม่ผ่าน → ไม่ใส่ CORS header เบราว์เซอร์จะบล็อกเอง
+  },
+};
+app.use(cors(corsOptions));
 
 // helper ส่ง error ให้เป็นรูปแบบเดียวกัน
 const wrap = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((e) => {
@@ -53,7 +73,7 @@ const wrap = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((e) => {
  * WEBHOOK — ต้องอ่าน raw body ก่อน express.json()
  * เงินเข้า Stripe สำเร็จจริง → เติมเครดิตผ่าน DB (จุดที่เชื่อถือได้สุด)
  * ═══════════════════════════════════════════════════════════ */
-app.post('/api/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/api/webhook', express.raw({ type: 'application/json', limit: '1mb' }), (req, res) => {
   let event;
   try {
     event = stripe.webhooks.constructEvent(
@@ -80,23 +100,82 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), (req, res) =
   res.json({ received: true });
 });
 
-app.use(express.json());
+// จำกัดขนาด body 1MB — พอสำหรับสลิปที่ย่อแล้ว (~200KB) แต่กันคนยัด payload ก้อนโตถล่ม DB/หน่วยความจำ
+app.use(express.json({ limit: '1mb' }));
+
+/* ═══════════════════════════════════════════════════════════
+ * RATE LIMITING — กัน brute-force รหัสผ่าน / โค้ด 2FA / สแปมอีเมลรีเซ็ต
+ * ────────────────────────────────────────────────────────────
+ * ใช้ express-rate-limit เก็บตัวนับใน memory (ต่อ 1 instance)
+ * ⚠️ ถ้าสเกลเป็นหลาย instance ทีหลัง ให้เปลี่ยน store เป็น Redis
+ * ⚠️ ต้องมี app.set('trust proxy', 1) ด้านบน ไม่งั้นนับ IP ผิด
+ * ═══════════════════════════════════════════════════════════ */
+const { ipKeyGenerator } = rateLimit;   // helper รองรับ IPv6 อย่างถูกต้อง
+
+// โรงงานสร้าง limiter — ตอบ 429 เป็น JSON ภาษาไทยให้หน้าเว็บอ่านง่าย
+function makeLimiter({ windowMs, limit, message, keyGenerator, skipSuccessfulRequests = false }) {
+  return rateLimit({
+    windowMs,
+    limit,
+    standardHeaders: 'draft-7',   // ส่ง header RateLimit-* บอกโควตาคงเหลือให้ client
+    legacyHeaders: false,
+    skipSuccessfulRequests,       // true = นับเฉพาะครั้งที่ "พลาด"
+    ...(keyGenerator ? { keyGenerator } : {}),
+    handler: (req, res) => res.status(429).json({ error: message }),
+  });
+}
+
+// ── ล็อกอิน: 8 ครั้งพลาด / 15 นาที ต่อ (IP + อีเมล) ──
+// คิดต่ออีเมลด้วย → ผู้โจมตีจะเจาะทีละบัญชีไม่ได้ และลูกค้าที่ใช้ NAT ร่วมกันไม่โดนล็อกพร้อมกัน
+// ครั้งที่ล็อกอิน "สำเร็จ" ไม่กินโควตา (skipSuccessfulRequests)
+const loginLimiter = makeLimiter({
+  windowMs: 15 * 60 * 1000, limit: 8, skipSuccessfulRequests: true,
+  message: 'พยายามเข้าสู่ระบบผิดบ่อยเกินไป กรุณารอ 15 นาทีแล้วลองใหม่',
+  keyGenerator: (req) => ipKeyGenerator(req.ip) + '|' + String(req.body?.email || '').trim().toLowerCase(),
+});
+
+// ── ยืนยันโค้ด 2FA 6 หลัก: 6 ครั้งพลาด / 15 นาที ต่อ IP ──
+// โค้ดมีแค่ 1,000,000 ชุด ต้องล็อกแน่นเป็นพิเศษกัน brute-force
+const twofaLimiter = makeLimiter({
+  windowMs: 15 * 60 * 1000, limit: 6, skipSuccessfulRequests: true,
+  message: 'ยืนยันรหัส 2FA ผิดบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่',
+});
+
+// ── สมัครสมาชิก: 5 บัญชี / ชม. ต่อ IP ── กันสร้างบัญชีรัว ๆ / สแปม
+const registerLimiter = makeLimiter({
+  windowMs: 60 * 60 * 1000, limit: 5,
+  message: 'สมัครสมาชิกบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่',
+});
+
+// ── ลืมรหัสผ่าน: 5 ครั้ง / ชม. ต่อ IP ── กันยิงอีเมลรีเซ็ตถล่มคนอื่น (email bombing)
+const forgotLimiter = makeLimiter({
+  windowMs: 60 * 60 * 1000, limit: 5,
+  message: 'ขอลิงก์รีเซ็ตบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่',
+});
+
+// ── โควตารวมทุก endpoint: 120 req / นาที ต่อ IP ── กันยิงถล่มทั่วไป (DoS เบา ๆ)
+// วางไว้ "ใต้" webhook ของ Stripe จึงไม่กระทบ webhook (Stripe retry ได้ตามปกติ)
+const apiLimiter = makeLimiter({
+  windowMs: 60 * 1000, limit: 120,
+  message: 'มีคำขอเข้ามาถี่เกินไป กรุณาชะลอสักครู่',
+});
+app.use('/api/', apiLimiter);
 
 /* ═══════════════════════════════════════════════════════════
  * AUTH
  * ═══════════════════════════════════════════════════════════ */
-app.post('/api/auth/register', wrap(async (req, res) => res.json(await register(req.body))));
-app.post('/api/auth/login',    wrap(async (req, res) => res.json(await login(req.body))));
+app.post('/api/auth/register', registerLimiter, wrap(async (req, res) => res.json(await register(req.body))));
+app.post('/api/auth/login',    loginLimiter,    wrap(async (req, res) => res.json(await login(req.body))));
 app.get('/api/auth/me', requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
 
 // ลืมรหัสผ่าน — ส่งลิงก์รีเซ็ตเข้าอีเมล (ตอบ ok เสมอ ไม่บอกว่าอีเมลมีจริงไหม)
-app.post('/api/auth/forgot', wrap(async (req, res) => res.json(await forgotPassword(req.body, process.env.FRONTEND_URL))));
+app.post('/api/auth/forgot', forgotLimiter, wrap(async (req, res) => res.json(await forgotPassword(req.body, process.env.FRONTEND_URL))));
 // ตั้งรหัสใหม่ด้วย token จากลิงก์ในอีเมล
 app.post('/api/auth/reset',  wrap(async (req, res) => res.json(await resetPassword(req.body))));
 
 // ── 2FA (Google Authenticator) ──
 // ขั้นที่ 2 ของล็อกอิน: ยืนยันรหัส 6 หลัก {tempToken, code}
-app.post('/api/auth/2fa/verify', wrap(async (req, res) => res.json(verify2fa(req.body))));
+app.post('/api/auth/2fa/verify', twofaLimiter, wrap(async (req, res) => res.json(verify2fa(req.body))));
 // เริ่มตั้งค่า 2FA (ต้องล็อกอินอยู่) → คืน QR ให้สแกน
 app.post('/api/auth/2fa/setup',  requireAuth, wrap(async (req, res) => res.json(await setup2fa(req.user))));
 // ยืนยันโค้ดเพื่อเปิด 2FA จริง {code}
@@ -214,6 +293,43 @@ app.post('/api/admin/deposits/:id/reject', requireAuth, requireAdmin, wrap(async
 }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+/* ═══════════════════════════════════════════════════════════
+ * ตรวจ ENV ก่อนเปิดใช้งาน — เตือนของที่ยังไม่ปลอดภัย
+ * บน production (NODE_ENV=production) ถ้าขาดของคอขาดใจ → หยุดทำงาน
+ * กันเปิดเว็บแบบ token เดาได้ / เติมเครดิตไม่ได้ โดยไม่รู้ตัว
+ * ═══════════════════════════════════════════════════════════ */
+function checkEnv() {
+  const isProd = process.env.NODE_ENV === 'production';
+  const warn = [];   // เตือนเฉย ๆ
+  const fatal = [];  // ร้ายแรง — บน production ต้องหยุด
+
+  if (!process.env.JWT_SECRET)
+    fatal.push('JWT_SECRET — ยังใช้ค่า dev ที่เดาได้ ใครก็ปลอม token เป็นแอดมินได้ (สุ่ม: openssl rand -hex 32)');
+  if (!process.env.STRIPE_WEBHOOK_SECRET)
+    fatal.push('STRIPE_WEBHOOK_SECRET — จุดเดียวที่เติมเครดิตจริง ถ้าไม่ตั้ง เงินเข้าแต่เครดิตไม่เข้า!');
+  if (!process.env.STRIPE_SECRET_KEY)
+    warn.push('STRIPE_SECRET_KEY — ยังไม่ตั้ง ระบบเติมเงิน Stripe จะใช้ไม่ได้');
+  if (allowedOrigins.includes('*'))
+    warn.push('FRONTEND_ORIGIN — ยังเปิด CORS ทุกโดเมน (*) ควรตั้งเป็นโดเมนเว็บจริง');
+  if ((process.env.ADMIN_PASSWORD || 'admin1234') === 'admin1234')
+    warn.push('ADMIN_PASSWORD — ยังเป็นรหัส default "admin1234" เปลี่ยนด่วน + เปิด 2FA');
+
+  if (warn.length || fatal.length) {
+    console.warn('\n⚠️  ตรวจ ENV ก่อนเปิดจริง:');
+    fatal.forEach((m) => console.warn('   🔴 ' + m));
+    warn.forEach((m) => console.warn('   🟠 ' + m));
+    console.warn('');
+  } else {
+    console.log('✅ ENV ครบถ้วน พร้อมเปิดใช้งาน');
+  }
+
+  if (isProd && fatal.length) {
+    console.error('❌ NODE_ENV=production แต่ขาด ENV สำคัญข้างบน — หยุดทำงานเพื่อความปลอดภัย');
+    process.exit(1);
+  }
+}
+checkEnv();
 
 const PORT = process.env.PORT || 4242;
 app.listen(PORT, () => console.log(`🚀 BoostHub backend ทำงานที่พอร์ต ${PORT}`));
