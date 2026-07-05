@@ -20,6 +20,24 @@ const { register, login, forgotPassword, resetPassword, verify2fa, setup2fa, ena
 const { CATALOG, priceOrder } = require('./services');
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_placeholder');
+
+// ── สร้างบัญชีแอดมินตัวแรกอัตโนมัติตอนเริ่มระบบ (เผื่อ deploy บนที่ที่รัน `npm run seed` เองไม่ได้ เช่น Render free tier) ──
+// ตั้งอีเมล/รหัสผ่านผ่าน ADMIN_EMAIL / ADMIN_PASSWORD ใน .env — ถ้ามีแอดมินอยู่แล้วจะข้ามไปเฉยๆ ไม่ทำอะไรซ้ำ
+(async () => {
+  try {
+    const bcrypt = require('bcryptjs');
+    const email = (process.env.ADMIN_EMAIL || 'admin@boosthub.local').toLowerCase();
+    const password = process.env.ADMIN_PASSWORD || 'admin1234';
+    if (!users.byEmail(email)) {
+      const password_hash = await bcrypt.hash(password, 10);
+      users.create({ email, password_hash, name: 'Admin', is_admin: 1 });
+      console.log('✅ สร้างบัญชีแอดมินอัตโนมัติ:', email, '(เปลี่ยนรหัสผ่านทันทีหลังล็อกอินครั้งแรก)');
+    }
+  } catch (e) {
+    console.error('สร้างแอดมินอัตโนมัติล้มเหลว:', e.message);
+  }
+})();
+
 const app = express();
 
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '*';
