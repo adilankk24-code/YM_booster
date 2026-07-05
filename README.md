@@ -1,57 +1,82 @@
-# BoostHub Backend — Stripe PromptPay
+# BoostHub Backend — SQLite + Auth + Orders + Stripe
 
-Backend รับชำระเงินผ่าน **Stripe PromptPay (QR)** แล้วเติมเครดิตให้ผู้ใช้ เงินเข้าบัญชี Stripe ของคุณจริง
+ระบบหลังบ้านจริงของเว็บ SMM: ฐานข้อมูล SQLite, สมัคร/ล็อกอิน (JWT), สั่งซื้อตัดเครดิตแบบ atomic, บันทึก ledger ทุกการเคลื่อนไหว, และรับเงินผ่าน Stripe (PromptPay/บัตร) + TrueMoney (อนุมัติสลิปเอง)
 
 ## ติดตั้ง
 
 ```bash
 cd backend
-cp .env.example .env      # ใส่คีย์จริงลงใน .env
+cp .env.example .env      # ใส่คีย์จริง + JWT_SECRET
 npm install
-npm start
+npm run seed             # สร้างบัญชีแอดมินตัวแรก
+npm start                # http://localhost:4242
 ```
 
-เซิร์ฟเวอร์จะรันที่ `http://localhost:4242`
+## สถาปัตยกรรม
 
-## ตั้งค่าคีย์ (`.env`)
-
-| ตัวแปร | เอามาจาก |
+| ไฟล์ | หน้าที่ |
 |---|---|
-| `STRIPE_SECRET_KEY` | Stripe Dashboard → Developers → API keys (`sk_live_...`) |
-| `STRIPE_PUBLISHABLE_KEY` | หน้าเดียวกัน (`pk_live_...`) |
-| `STRIPE_WEBHOOK_SECRET` | Dashboard → Developers → Webhooks → endpoint (`whsec_...`) |
-
-> ⚠️ **ต้องเปิดใช้ PromptPay** ใน Stripe Dashboard → Settings → Payment methods ก่อน (บัญชีต้องเป็นประเทศไทย / สกุลเงิน THB)
+| `db.js` | ฐานข้อมูล SQLite — users, orders, ledger, deposits + ทุกการเคลื่อนไหวเครดิตแบบ transaction |
+| `auth.js` | สมัคร/ล็อกอิน, hash รหัสด้วย bcrypt, ออก JWT, middleware `requireAuth` / `requireAdmin` |
+| `services.js` | แคตตาล็อกบริการ + เรตราคา → คำนวณราคาที่เซิร์ฟเวอร์ (ไม่เชื่อราคาจาก client) |
+| `server.js` | รวม API ทั้งหมด |
+| `seed.js` | สร้างแอดมินตัวแรก |
 
 ## Endpoints
 
-| Method | Path | หน้าที่ |
+### Auth
+| Method | Path | |
 |---|---|---|
-| POST | `/api/promptpay/create` | สร้าง PaymentIntent + คืน clientSecret |
-| GET | `/api/promptpay/status/:id` | เช็คสถานะการจ่าย (poll) |
-| POST | `/api/webhook` | Stripe ยิงมาเมื่อจ่ายสำเร็จ → เติมเครดิต |
-| GET | `/api/balance/:userId` | ดูยอดเครดิต |
+| POST | `/api/auth/register` | สมัคร → คืน `{token, user}` |
+| POST | `/api/auth/login` | ล็อกอิน → คืน `{token, user}` |
+| POST | `/api/auth/forgot` | ลืมรหัส → ส่งลิงก์รีเซ็ตเข้าอีเมล `{email}` (ตอบ ok เสมอ) |
+| POST | `/api/auth/reset` | ตั้งรหัสใหม่ `{token, password}` → ล็อกอินให้เลย |
+| GET | `/api/auth/me` | ข้อมูลตัวเอง (ต้องมี token) |
 
-## ตั้งค่า Webhook (สำคัญที่สุด — จุดที่เติมเครดิตจริง)
+แนบ token ทุก request ที่ต้องล็อกอิน: `Authorization: Bearer <token>`
 
-1. Dashboard → Developers → Webhooks → Add endpoint
-2. URL: `https://your-backend.example.com/api/webhook`
-3. เลือก event: `payment_intent.succeeded`
-4. เอา signing secret (`whsec_...`) ใส่ใน `.env`
+### ลูกค้า (ต้องล็อกอิน)
+| Method | Path | |
+|---|---|---|
+| GET | `/api/services` | แคตตาล็อก + เรตราคา |
+| POST | `/api/orders` | สั่งซื้อ `{platform, serviceId, qty, link}` → ตัดเครดิต atomic |
+| GET | `/api/orders` | ออเดอร์ของตัวเอง |
+| GET | `/api/ledger` | ประวัติเครดิตเข้า-ออก |
+| GET | `/api/balance` | ยอดเครดิตคงเหลือ |
 
-ทดสอบ local ด้วย Stripe CLI:
+### เติมเงิน (ล็อกอินหรือ guest ก็ได้)
+ลูกค้าที่ล็อกอินแล้ว (แนบ token) เครดิตจะผูกกับบัญชีจริง — ถ้ายังไม่ได้ต่อระบบล็อกอิน จะใช้ id ที่หน้าเว็บส่งมา (guest) และระบบสร้าง user row ให้อัตโนมัติเมื่อเงินเข้า
+| Method | Path | |
+|---|---|---|
+| POST | `/api/promptpay/create` | สร้าง PaymentIntent พร้อมเพย์ QR `{amountBaht, userId?, email?}` |
+| POST | `/api/card/create-intent` | สร้าง PaymentIntent บัตรเครดิต/เดบิต `{amountBaht, userId?, email?}` |
+| GET | `/api/promptpay/status/:id` | poll สถานะ |
+| POST | `/api/deposits/truemoney` | แจ้งโอน TrueMoney + สลิป → เข้าคิวรออนุมัติ (ต้องล็อกอิน) |
+| POST | `/api/webhook` | Stripe ยิงมาเมื่อจ่ายสำเร็จ → เติมเครดิตอัตโนมัติ (กันซ้ำด้วย pi_id) |
+
+### แอดมิน (ต้อง `is_admin`)
+| Method | Path | |
+|---|---|---|
+| GET | `/api/admin/overview` | สมาชิก + ออเดอร์ + สลิป + สถิติ |
+| PATCH | `/api/admin/orders/:id` | อัปเดตสถานะ `{status, progress}` |
+| POST | `/api/admin/orders/:id/refund` | ยกเลิก + คืนเครดิต |
+| POST | `/api/admin/users/:id/credit` | เติมเครดิตให้ผู้ใช้ `{amount}` |
+| POST | `/api/admin/users/:id/ban` | ระงับ/ปลด `{banned}` |
+| POST | `/api/admin/deposits/:id/approve` | อนุมัติสลิป TrueMoney |
+| POST | `/api/admin/deposits/:id/reject` | ปฏิเสธสลิป |
+
+## ที่ยังต้องทำต่อ (เฟสถัดไป)
+
+- **ต่อ SMM provider จริง** — ตอนนี้ออเดอร์เลื่อนสถานะเอง ต้องยิง API ไป supplier แล้ว sync กลับ
+- **เช็คสลิปอัตโนมัติ** (SlipOK/EasySlip) กันสลิปปลอม
+- **Realtime** (WebSocket/SSE) แจ้งหน้าเว็บเมื่อเครดิต/ออเดอร์เปลี่ยน
+- **แจ้งเตือน** อีเมล/LINE, **คูปอง/โปรโมชั่น**, **affiliate/referral**
+- ขึ้น production: ตั้ง `FRONTEND_ORIGIN` เป็นโดเมนจริง, `JWT_SECRET` สุ่มยาว, พิจารณาย้าย SQLite → Postgres เมื่อโตขึ้น
+
+## Stripe Webhook (จุดที่เติมเครดิตจริง)
+
 ```bash
 stripe listen --forward-to localhost:4242/api/webhook
 stripe trigger payment_intent.succeeded
 ```
-
-## เชื่อมกับหน้าเว็บ
-
-ดู `frontend-integration.example.js` — โหลด `https://js.stripe.com/v3/` แล้วเรียก `confirmPromptPayPayment()` ด้วย publishable key เพื่อรับ QR จริงจาก Stripe
-
-## ⚠️ ก่อน production
-
-- เปลี่ยน in-memory store (`balances`, `processed`) เป็น **ฐานข้อมูลจริง** (Postgres / Mongo / Firebase)
-- ใส่ระบบ auth (JWT / session) — อย่าเชื่อ `userId` ที่ส่งมาจาก client ตรง ๆ
-- ตั้ง `FRONTEND_ORIGIN` เป็นโดเมนจริง (ไม่ใช่ `*`)
-- **Revoke คีย์เก่าที่เคยรั่ว** ทั้งหมด
+Dashboard → Webhooks → Add endpoint → event `payment_intent.succeeded` → เอา `whsec_...` ใส่ `.env`
